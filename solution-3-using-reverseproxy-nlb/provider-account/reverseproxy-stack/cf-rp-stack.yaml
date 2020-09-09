@@ -1,0 +1,309 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  ProjectName:
+    Type: String
+    Description: Project name to link stacks
+  NLBVPCEndpointServiceConsumerAccountId:
+    Type: String
+    Description: VPC Endpoint Service consumer account id
+  NLBVPCEndpointServiceConsumerRoleName:
+    Type: String
+    Description: VPC Endpoint Service consumer role name
+  NLBVPCEndpointServiceConsumerUserName:
+    Type: String
+    Description: VPC Endpoint Service consumer user name
+  KeyPair:
+    Type: String
+    Description: Keypair to login into Bastion Host and Service Consumer host
+  ALBDNSEndpoint:
+    Type: String
+    Description: Application Load Balancer DNS Endpoint
+  EC2Ami:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Description: EC2 AMI ID
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+Resources:
+  BastionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Allows SSH access'
+      VpcId: 
+        Fn::ImportValue:
+          !Sub '${ProjectName}:VPC'
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: 0.0.0.0/0
+
+  BastionHost:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref EC2Ami
+      InstanceType: t2.micro
+      KeyName: !Ref KeyPair
+      SecurityGroupIds:
+      - !Ref BastionSecurityGroup
+      SubnetId: 
+        Fn::ImportValue:
+          !Sub '${ProjectName}:PublicSubnet1'
+  
+  #loadBalancer
+  NetworkLoadBalancer:
+      Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+      Properties:
+        Type: network
+        Scheme: internal
+        LoadBalancerAttributes:
+        - Key: load_balancing.cross_zone.enabled
+          Value: true
+        Subnets:
+        - Fn::ImportValue:
+            !Sub '${ProjectName}:PrivateSubnet3'
+        - Fn::ImportValue:
+            !Sub '${ProjectName}:PrivateSubnet4'
+
+  #targetGroup    
+  NLBALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPort: 80
+      HealthCheckProtocol: TCP
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      Port: 80
+      Protocol: TCP
+      Name: !Sub '${ProjectName}-nlb-tg'
+      Targets:
+      - Id: !Ref NGINXProxyInstance1
+      - Id: !Ref NGINXProxyInstance2
+      TargetType: instance
+      UnhealthyThresholdCount: 2
+      VpcId: 
+        Fn::ImportValue:
+          !Sub '${ProjectName}:VPC'
+  
+  NetworkLoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+      - TargetGroupArn: !Ref NLBALBTargetGroup
+        Type: forward
+      LoadBalancerArn: !Ref NetworkLoadBalancer
+      Port: 80
+      Protocol: TCP
+  
+  NetworkLoadBalancerVPCEndpointService:
+    Type: AWS::EC2::VPCEndpointService
+    Properties: 
+      AcceptanceRequired: false
+      NetworkLoadBalancerArns: 
+        - !Ref NetworkLoadBalancer
+
+  NetworkLoadBalancerVPCEndpointServicePermissions:
+    Type: AWS::EC2::VPCEndpointServicePermissions
+    Properties: 
+      AllowedPrincipals:
+      - Fn::Join:
+        - ""
+        - - 'arn:aws:iam::'
+          - !Ref NLBVPCEndpointServiceConsumerAccountId
+          - ':role/'
+          - !Ref NLBVPCEndpointServiceConsumerRoleName
+      - Fn::Join:
+        - ""
+        - - 'arn:aws:iam::'
+          - !Ref NLBVPCEndpointServiceConsumerAccountId
+          - ':user/'
+          - !Ref NLBVPCEndpointServiceConsumerUserName 
+      ServiceId: !Ref NetworkLoadBalancerVPCEndpointService
+   
+  #nginxSecurityGroup:
+  NGINXSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for NGINX
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        SourceSecurityGroupId: 
+          Fn::GetAtt: [ BastionSecurityGroup , GroupId ]
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp:
+          Fn::ImportValue:
+            !Sub '${ProjectName}:PrivateSubnet3CIDR'
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 
+          Fn::ImportValue:
+            !Sub '${ProjectName}:PrivateSubnet4CIDR'
+      VpcId: 
+        Fn::ImportValue:
+          !Sub '${ProjectName}:VPC'
+          
+  NGINXProxyInstance1:
+    Type: AWS::EC2::Instance
+    DependsOn: NGINXSecurityGroup
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          commands:
+            01_install_nginx:
+              command: amazon-linux-extras install -y nginx1
+            02_enable_nginx:
+              command: systemctl enable nginx
+            03_start_nginx:
+              command: systemctl start nginx
+          files:
+            "/etc/nginx/nginx.conf":
+              content: !Sub |
+                # This part is copied from the default nginx.conf
+                user nginx;
+                worker_processes auto;
+                error_log /var/log/nginx/error.log;
+                pid /var/run/nginx.pid;
+
+                # Load dynamic modules. See /usr/share/nginx/README.dynamic.
+                include /usr/share/nginx/modules/*.conf;
+
+                events {
+                    worker_connections 1024;
+                }
+                http {
+                  server {
+                      location / {
+                          proxy_set_header X-Real-IP $remote_addr;
+                          proxy_pass http://${ALBDNSEndpoint}:80;
+                      } 
+                  }
+                }
+                
+            "/etc/cfn/cfn-hup.conf":
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+                interval=1
+              mode: '000400'
+              owner: root
+              group: root
+            "/etc/cfn/hooks.d/cfn-auto-reloader.conf":
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.nginxInstance.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource NGINXProxyInstance1 --region ${AWS::Region} && systemctl restart nginx
+                runas=root
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: true
+                ensureRunning: true
+                files:
+                - /etc/cfn/cfn-hup.conf
+                - /etc/cfn/hooks.d/cfn-auto-reloader.conf
+    Properties:
+      InstanceType: t3.small
+      KeyName: !Ref KeyPair
+      SubnetId:
+        Fn::ImportValue:
+          !Sub '${ProjectName}:PrivateSubnet3'
+      SecurityGroupIds:
+      - !Ref NGINXSecurityGroup
+      ImageId: !Ref EC2Ami
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          yum update -y
+          yum install -y aws-cfn-boostrap cloud-init aws-cli
+          /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource NGINXProxyInstance1 --region ${AWS::Region}
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource NGINXProxyInstance1 --region ${AWS::Region}
+  
+  NGINXProxyInstance2:
+    Type: AWS::EC2::Instance
+    DependsOn: NGINXSecurityGroup
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          commands:
+            01_install_nginx:
+              command: amazon-linux-extras install -y nginx1
+            02_enable_nginx:
+              command: systemctl enable nginx
+            03_start_nginx:
+              command: systemctl start nginx
+          files:
+            "/etc/nginx/nginx.conf":
+              content: !Sub |
+                # This part is copied from the default nginx.conf
+                user nginx;
+                worker_processes auto;
+                error_log /var/log/nginx/error.log;
+                pid /var/run/nginx.pid;
+
+                # Load dynamic modules. See /usr/share/nginx/README.dynamic.
+                include /usr/share/nginx/modules/*.conf;
+
+                events {
+                    worker_connections 1024;
+                }
+                http {
+                  server {
+                      location / {
+                          proxy_set_header X-Real-IP $remote_addr;
+                          proxy_pass http://${ALBDNSEndpoint}:80;    
+                      } 
+                  }
+                }  
+                
+            "/etc/cfn/cfn-hup.conf":
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+                interval=1
+              mode: '000400'
+              owner: root
+              group: root
+            "/etc/cfn/hooks.d/cfn-auto-reloader.conf":
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.nginxInstance.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource NGINXProxyInstance2 --region ${AWS::Region} && systemctl restart nginx
+                runas=root
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: true
+                ensureRunning: true
+                files:
+                - /etc/cfn/cfn-hup.conf
+                - /etc/cfn/hooks.d/cfn-auto-reloader.conf
+    Properties:
+      InstanceType: t3.small
+      KeyName: !Ref KeyPair
+      SubnetId: 
+        Fn::ImportValue:
+          !Sub '${ProjectName}:PrivateSubnet4'
+      SecurityGroupIds:
+      - !Ref NGINXSecurityGroup
+      ImageId: !Ref EC2Ami
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          yum update -y
+          yum install -y aws-cfn-boostrap cloud-init aws-cli
+          /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource NGINXProxyInstance2 --region ${AWS::Region}
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource NGINXProxyInstance2 --region ${AWS::Region}
+Outputs:
+  NetworkLoadBalancerVPCEndpointService:
+    Description: NetworkLoadBalancer VPC EndpointService Name
+    Value: !Ref NetworkLoadBalancerVPCEndpointService
+    Export: 
+      Name: !Sub '${ProjectName}:NetworkLoadBalancerVPCEndpointService'

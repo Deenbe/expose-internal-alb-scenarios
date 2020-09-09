@@ -1,0 +1,211 @@
+Parameters:
+  ProjectName:
+    Type: String
+    Description: Project name to link stacks
+  LambdaFunctionBucketName:
+    Type: String
+    Description: Bucket that contains Lambda function code
+  NLBVPCEndpointServiceConsumerAccountId:
+    Type: String
+    Description: VPC Endpoint Service consumer account id
+  NLBVPCEndpointServiceConsumerRoleName:
+    Type: String
+    Description: VPC Endpoint Service consumer role name
+  NLBVPCEndpointServiceConsumerUserName:
+    Type: String
+    Description: VPC Endpoint Service consumer user name
+  DDBTableName:
+    Type: String
+    Description: DDB Table name
+    Default: ALB_NODE_IP_ADDRESS_INFO
+Resources: 
+  ALBIPAddressInfoDDBTable: 
+    Type: AWS::DynamoDB::Table
+    Properties: 
+      AttributeDefinitions: 
+        - AttributeName: "NODE_IP"
+          AttributeType: "S"
+      KeySchema: 
+        - AttributeName: "NODE_IP"
+          KeyType: "HASH"
+      ProvisionedThroughput: 
+        ReadCapacityUnits: "5"
+        WriteCapacityUnits: "5"
+      TableName: !Ref DDBTableName
+  NetworkLoadBalancer:
+      Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+      Properties:
+        Type: network
+        Scheme: internal
+        LoadBalancerAttributes:
+        - Key: load_balancing.cross_zone.enabled
+          Value: true
+        Subnets:
+        - Fn::ImportValue:
+            !Sub '${ProjectName}:PrivateSubnet3'
+        - Fn::ImportValue:
+            !Sub '${ProjectName}:PrivateSubnet4'
+  NLBALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 10
+      HealthCheckProtocol: TCP
+      HealthyThresholdCount: 2
+      TargetType: ip
+      Name: !Sub '${ProjectName}-nlb-tg'
+      Port: 80
+      Protocol: TCP
+      UnhealthyThresholdCount: 2
+      TargetGroupAttributes:
+      - Key: deregistration_delay.timeout_seconds
+        Value: 120
+      VpcId:
+        Fn::ImportValue:
+          !Sub '${ProjectName}:VPC'
+  NetworkLoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+      - TargetGroupArn: !Ref NLBALBTargetGroup
+        Type: forward
+      LoadBalancerArn: !Ref NetworkLoadBalancer
+      Port: 80
+      Protocol: TCP
+  NetworkLoadBalancerVPCEndpointService:
+    Type: AWS::EC2::VPCEndpointService
+    Properties: 
+      AcceptanceRequired: false
+      NetworkLoadBalancerArns: 
+        - !Ref NetworkLoadBalancer
+  NetworkLoadBalancerVPCEndpointServicePermissions:
+    Type: AWS::EC2::VPCEndpointServicePermissions
+    Properties: 
+      AllowedPrincipals:
+      - Fn::Join:
+        - ""
+        - - 'arn:aws:iam::'
+          - !Ref NLBVPCEndpointServiceConsumerAccountId
+          - ':role/'
+          - !Ref NLBVPCEndpointServiceConsumerRoleName
+      - Fn::Join:
+        - ""
+        - - 'arn:aws:iam::'
+          - !Ref NLBVPCEndpointServiceConsumerAccountId
+          - ':user/'
+          - !Ref NLBVPCEndpointServiceConsumerUserName 
+      ServiceId: !Ref NetworkLoadBalancerVPCEndpointService
+  LambdaFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Description: Register Application Load Balancer to Network Load Balancer
+      Code:
+        S3Bucket: !Ref LambdaFunctionBucketName
+        S3Key: populate_NLB_TG_with_ALB.zip
+      FunctionName: populate_NLB_TG_with_ALB
+      Handler: populate_NLB_TG_with_ALB.lambda_handler
+      MemorySize: 128
+      Role: !GetAtt LambdaIAMRole.Arn
+      Runtime: python3.8
+      Timeout: 300
+      Environment:
+        Variables:
+          ALB_DNS_NAME: 
+            Fn::ImportValue:
+              !Sub '${ProjectName}:ALBLoadBalancerDNSEndpoint'
+          NLB_TG_ARN: !Ref NLBALBTargetGroup
+          S3_BUCKET: 
+            Fn::ImportValue:
+              !Sub '${ProjectName}:LambdaInvocationTrackBucket'
+          MAX_LOOKUP_PER_INVOCATION: 50
+          INVOCATIONS_BEFORE_DEREGISTRATION: 3
+          CW_METRIC_FLAG_IP_COUNT: true
+          ALB_LISTENER: 80
+  ScheduledRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Description: ScheduledRule
+      ScheduleExpression: rate(1 minute)
+      State: ENABLED
+      Targets:
+        - Arn:
+            'Fn::GetAtt':
+              - LambdaFunction
+              - Arn
+          Id: TargetFunctionV1
+    DependsOn:
+      - LambdaFunction
+  LambdaInvokePermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName:
+        'Fn::GetAtt':
+          - LambdaFunction
+          - Arn
+      Principal: events.amazonaws.com
+      Action: 'lambda:InvokeFunction'
+      SourceArn:
+        'Fn::GetAtt':
+          - ScheduledRule
+          - Arn
+  LambdaIAMRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: Lambda-ALBasTarget
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: LambdaLogging
+                Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource:
+                  - 'arn:aws:logs:*:*:*'
+              - Sid: S3
+                Action:
+                  - 's3:Get*'
+                  - 's3:PutObject'
+                  - 's3:CreateBucket'
+                  - 's3:ListBucket'
+                  - 's3:ListAllMyBuckets'
+                Effect: Allow
+                Resource: '*'
+              - Sid: ELB
+                Action:
+                  - 'elasticloadbalancing:Describe*'
+                  - 'elasticloadbalancing:RegisterTargets'
+                  - 'elasticloadbalancing:DeregisterTargets'
+                Effect: Allow
+                Resource: '*'
+              - Sid: CW
+                Action:
+                  - 'cloudwatch:putMetricData'
+                Effect: Allow
+                Resource: '*'
+              - Sid: DDB
+                Action:
+                  - 'dynamodb:BatchGetItem'
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:Query'
+                  - 'dynamodb:Scan'
+                  - 'dynamodb:BatchWriteItem'
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:UpdateItem'
+                Effect: Allow
+                Resource: !Sub 'arn:aws:dynamodb:*:*:table/${DDBTableName}'
+Outputs:
+  NetworkLoadBalancerVPCEndpointService:
+    Description: NetworkLoadBalancer VPC EndpointService Name
+    Value: !Ref NetworkLoadBalancerVPCEndpointService
+    Export: 
+      Name: !Sub '${ProjectName}:NetworkLoadBalancerVPCEndpointService'

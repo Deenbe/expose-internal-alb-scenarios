@@ -1,0 +1,69 @@
+Parameters:
+  ProjectName:
+    Type: String
+    Description: Project name to link stacks
+Resources:
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: Private ALB API
+      Description: HTTP API
+      ProtocolType: HTTP
+  VpcLink:
+    Type: AWS::ApiGatewayV2::VpcLink
+    Properties: 
+      Name: ALBVPCLink
+      SecurityGroupIds: 
+      - Fn::ImportValue:
+          !Sub '${ProjectName}:VPCLinkSecurityGroup'
+      SubnetIds: 
+      - Fn::ImportValue:
+          !Sub '${ProjectName}:PrivateSubnet1'
+      - Fn::ImportValue:
+          !Sub '${ProjectName}:PrivateSubnet2'
+  DemoCallRoute:
+    Type: AWS::ApiGatewayV2::Route
+    DependsOn:
+    - ALBIntegration
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'GET /democall'
+      Target: !Join 
+        - /
+        - - integrations
+          - !Ref ALBIntegration
+  ALBIntegration:
+    Type: 'AWS::ApiGatewayV2::Integration'
+    Properties:
+      ApiId: !Ref HttpApi
+      Description: ALB Integration
+      IntegrationType: HTTP_PROXY
+      IntegrationUri:
+        Fn::ImportValue:
+          !Sub '${ProjectName}:ApplicationLoadBalancerListener'
+      IntegrationMethod: GET
+      ConnectionType: VPC_LINK
+      ConnectionId: !Ref VpcLink
+      PayloadFormatVersion: 1.0
+  APIStage:
+    Type: 'AWS::ApiGatewayV2::Stage'
+    Properties:
+      StageName: service
+      ApiId: !Ref HttpApi
+      AutoDeploy: true
+  Deployment:
+    Type: 'AWS::ApiGatewayV2::Deployment'
+    DependsOn:
+      - DemoCallRoute
+      - APIStage
+    Properties:
+      Description: API Deployment
+      ApiId: !Ref HttpApi
+      StageName: service
+Outputs:
+  apiInvokeURL:
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/service"
+    Export: 
+      Name: !Sub '${ProjectName}:apiInvokeURL'
+
+

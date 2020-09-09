@@ -1,0 +1,33 @@
+Parameters:
+  ProjectName:
+    Description: Project Name
+    Type: String
+Resources:
+  GlobalAccelerator:
+    Type: 'AWS::GlobalAccelerator::Accelerator'
+    Properties:
+      Name: ALBAccelerator
+      IpAddressType: "IPV4"
+      Enabled: true
+  GlobalAcceleratorListener:
+    Type: 'AWS::GlobalAccelerator::Listener'
+    Properties:
+      AcceleratorArn: !Ref GlobalAccelerator
+      Protocol: TCP
+      PortRanges:
+        - FromPort: '80'
+          ToPort: '80'
+  ApSouthEast2EndpointGroup:
+    Type: 'AWS::GlobalAccelerator::EndpointGroup'
+    Properties:
+      ListenerArn: !Ref GlobalAcceleratorListener
+      EndpointGroupRegion: ap-southeast-2
+      EndpointConfigurations:
+        - EndpointId:
+            Fn::ImportValue:
+              !Sub '${ProjectName}:ApplicationLoadBalancer'
+          ClientIPPreservationEnabled: true
+Outputs:
+  GlobalAcceleDNSEndpoint:
+    Description: DNS for Global Accelerator
+    Value: !GetAtt GlobalAccelerator.DnsName

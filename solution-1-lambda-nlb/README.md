@@ -94,6 +94,7 @@ curl http://nlb-a-Netwo-1GJCQ107QC2FP-72c108925e5b89ca.elb.ap-southeast-2.amazon
 - install Apache HTTP server benchmarking tool on EC2 instance in the private subnet in Service Consumer account
     - sudo yum install httpd-tools
 - Perform Stress Test: the following will send 1.5 million http requests, 1000 concurrent requests to your Private NLB via VPC Endpoint
+    
     - ab -n 1500000 -c 1000 http://VPC_ENDPOINT/service/democall
 
     - replace VPC Endpoint DNS endpoint with your environment VPC Endpoint DNS
